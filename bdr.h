@@ -543,6 +543,8 @@ extern void
 bdr_copytable(PGconn *copyfrom_conn, PGconn *copyto_conn,
 		const char * copyfrom_query, const char *copyto_query);
 
+extern bool bdr_drop_my_replication_slot(const char *remote_node_dsn);
+
 /* local node info cache (bdr_nodecache.c) */
 void bdr_nodecache_invalidate(void);
 bool bdr_local_node_read_only(void);

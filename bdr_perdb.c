@@ -230,6 +230,8 @@ bdr_maintain_db_workers(void)
 	Datum				values[BDR_CON_Q_NARGS];
 	char				sysid_str[33];
 	char				our_status;
+	List			   *conns;
+	ListCell		   *lc;
 
 	/* Should be called from the perdb worker */
 	Assert(IsBackgroundWorker);
@@ -260,6 +262,8 @@ bdr_maintain_db_workers(void)
 	bgw.bgw_notify_pid = 0;
 
 	StartTransactionCommand();
+
+	conns = bdr_read_connection_configs();
 
 	SPI_connect();
 
@@ -315,7 +319,6 @@ bdr_maintain_db_workers(void)
 		Assert(!isnull);
 
 		LWLockAcquire(BdrWorkerCtl->lock, LW_EXCLUSIVE);
-
 		for (slotoff = 0; slotoff < bdr_max_workers; slotoff++)
 		{
 			BdrWorker  *w = &BdrWorkerCtl->slots[slotoff];
@@ -376,6 +379,7 @@ bdr_maintain_db_workers(void)
 				kill(w->worker_pid, SIGTERM);
 			}
 		}
+		LWLockRelease(BdrWorkerCtl->lock);
 
 		if (found_alive)
 		{
@@ -385,7 +389,6 @@ bdr_maintain_db_workers(void)
 		else
 		{
 			List *drop = NIL;
-			ListCell *dc;
 			bool we_were_dropped;
 			NameData slot_name_dropped; /* slot of the dropped node */
 
@@ -427,12 +430,41 @@ bdr_maintain_db_workers(void)
 			}
 			LWLockRelease(ReplicationSlotControlLock);
 
-			foreach(dc, drop)
+			foreach(lc, drop)
 			{
-				char *slot_name = (char *) lfirst(dc);
+				char *slot_name = (char *) lfirst(lc);
 				elog(LOG, "dropping slot %s due to node part", slot_name);
 				ReplicationSlotDrop(slot_name);
 				elog(LOG, "dropped slot %s due to node part", slot_name);
+			}
+
+			foreach(lc, conns)
+			{
+				BdrConnectionConfig *cfg = (BdrConnectionConfig*) lfirst(lc);
+
+				if (cfg->is_unidirectional
+					&& cfg->sysid == node_sysid
+					&& cfg->timeline == node_timeline
+					&& cfg->dboid == node_datoid
+					&& cfg->origin_is_my_id)
+				{
+					elog(LOG, "dropping remote slot for unidirectional connection on node ("UINT64_FORMAT",%u,%u) due to node part",
+						 node_sysid, node_timeline, node_datoid);
+					/*
+					 * Don't die because of errors here as the remote node
+					 * might not even be alive anymore.
+					 */
+					PG_TRY();
+					{
+						bdr_drop_my_replication_slot(cfg->dsn);
+					}
+					PG_CATCH();
+					{
+						elog(WARNING, "failed to drop the remote slot on node ("UINT64_FORMAT",%u,%u)",
+							 node_sysid, node_timeline, node_datoid);
+					}
+					PG_END_TRY();
+				}
 			}
 
 			/*
@@ -442,9 +474,16 @@ bdr_maintain_db_workers(void)
 			 */
 		}
 
-		LWLockRelease(BdrWorkerCtl->lock);
 		continue;
 	}
+
+	/* Free the connection list */
+	foreach(lc, conns)
+	{
+		BdrConnectionConfig *cfg = (BdrConnectionConfig*) lfirst(lc);
+		bdr_free_connection_config(cfg);
+	}
+	list_free(conns);
 
 	/* If our own node is dead, don't start new connections to other nodes */
 	if (our_status == 'k')

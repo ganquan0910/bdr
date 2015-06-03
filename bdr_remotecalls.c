@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "bdr.h"
+#include "bdr_internal.h"
 
 #include "fmgr.h"
 #include "funcapi.h"
@@ -579,9 +580,87 @@ bdr_test_remote_connectback(PG_FUNCTION_ARGS)
 		free_remote_node_info(&ri);
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(bdr_cleanup_conn_close,
-							PointerGetDatum(&conn));
+								PointerGetDatum(&conn));
 
 	PQfinish(conn);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(returnTuple));
+}
+
+
+/*
+ * Drops replication slot on remote node that has been used by the local node.
+ */
+bool
+bdr_drop_my_replication_slot(const char *remote_node_dsn)
+{
+	PGconn	   *conn;
+	PGresult   *res;
+	NameData	slotname;
+
+	conn = bdr_connect_nonrepl(remote_node_dsn, "bdr_drop_replication_slot");
+
+	PG_ENSURE_ERROR_CLEANUP(bdr_cleanup_conn_close,
+							PointerGetDatum(&conn));
+	{
+		struct remote_node_info ri;
+		const char *	values[1];
+		Oid				types[1] = { TEXTOID };
+
+		/* Try connecting and build slot name from retrieved info */
+		bdr_get_remote_nodeinfo_internal(conn, &ri);
+		bdr_slot_name(&slotname, GetSystemIdentifier(), ThisTimeLineID,
+					  MyDatabaseId, ri.dboid);
+		free_remote_node_info(&ri);
+
+		values[0] = NameStr(slotname);
+
+		/* Check if the slot exists */
+		res = PQexecParams(conn,
+						   "SELECT plugin "
+						   "FROM pg_catalog.pg_replication_slots "
+						   "WHERE slot_name = $1",
+						   1, types, values, NULL, NULL, 0);
+
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			ereport(ERROR,
+					(errmsg("getting remote slot info failed"),
+					errdetail("SELECT FROM pg_catalog.pg_replication_slots failed with: %s",
+						PQerrorMessage(conn))));
+		}
+
+		/* Slot not found return false */
+		if (PQntuples(res) == 0)
+		{
+			PQfinish(conn);
+			return false;
+		}
+
+		/* Slot found, validate that it's BDR slot */
+		if (PQgetisnull(res, 0, 0))
+			elog(ERROR, "Unexpectedly null field %s", PQfname(res, 0));
+
+		if (strcmp("bdr", PQgetvalue(res, 0, 0)) != 0)
+			ereport(ERROR,
+					(errmsg("slot %s is not BDR slot", NameStr(slotname))));
+
+		res = PQexecParams(conn, "SELECT pg_drop_replication_slot($1)",
+						   1, types, values, NULL, NULL, 0);
+
+		/* And finally, drop the slot. */
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			ereport(ERROR,
+					(errmsg("remote slot drop failed"),
+					errdetail("SELECT pg_drop_replication_slot() failed with: %s",
+						PQerrorMessage(conn))));
+		}
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(bdr_cleanup_conn_close,
+								PointerGetDatum(&conn));
+
+	PQfinish(conn);
+
+	return true;
 }
